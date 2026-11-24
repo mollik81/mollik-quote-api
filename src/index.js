@@ -1,6 +1,8 @@
 import { Hono } from "hono";
 import { serve } from "@hono/node-server";
-import { paymentMiddleware } from "x402-hono";
+import { paymentMiddleware, x402ResourceServer } from "@x402/hono";
+import { ExactEvmScheme } from "@x402/evm/exact/server";
+import { HTTPFacilitatorClient } from "@x402/core/server";
 
 // Payments go straight to Mollik's MetaMask wallet on Base. No money
 // leaves his wallet to run this API; buyers pay INTO this address.
@@ -19,38 +21,48 @@ const QUOTES = [
   { quote: "The secret of getting ahead is getting started.", author: "Mark Twain" },
 ];
 
+// x402 v2 resource server. The default x402.org facilitator only
+// supports testnets, so this uses PayAI's public facilitator, which
+// supports exact-scheme payments on Base mainnet (eip155:8453).
+// No API key, no account — the facilitator only verifies/setlles.
+const facilitatorClient = new HTTPFacilitatorClient({
+  url: "https://facilitator.payai.network",
+});
+const resourceServer = new x402ResourceServer(facilitatorClient).register(
+  "eip155:8453",
+  new ExactEvmScheme(),
+);
+
 const app = new Hono();
 
-// Paid endpoint: $0.005 USDC on Base, verified by the x402 facilitator.
+// Paid endpoint: $0.005 USDC on Base (x402 v2, exact scheme).
 // Unpaid requests get HTTP 402 with the payment details — that is the
 // x402 protocol, not an error. No API key, no account, no signup.
 app.use(
-  paymentMiddleware(PAY_TO, {
-    "/quote": {
-      price: PRICE,
-      network: "base",
-      config: {
-        description: "One daily motivational quote. $0.005 USDC per call on Base.",
-        mimeType: "application/json",
-        maxTimeoutSeconds: 60,
-        outputSchema: {
-          type: "object",
-          properties: {
-            quote: { type: "string" },
-            author: { type: "string" },
-            date: { type: "string" },
+  paymentMiddleware(
+    {
+      "GET /quote": {
+        accepts: [
+          {
+            scheme: "exact",
+            price: PRICE,
+            network: "eip155:8453",
+            payTo: PAY_TO,
+            maxTimeoutSeconds: 60,
           },
-        },
+        ],
+        description: "One daily motivational quote. $0.005 USDC per call on Base.",
       },
     },
-  }),
+    resourceServer,
+  ),
 );
 
 // Free: service info (lets vAPI and humans see what this is).
 app.get("/", (c) =>
   c.json({
     name: "Mollik Daily Quote API",
-    paid_endpoint: "GET /quote — $0.005 USDC on Base (x402)",
+    paid_endpoint: "GET /quote — $0.005 USDC on Base (x402 v2)",
     payTo: PAY_TO,
     docs: "/llms.txt",
     health: "/health",
@@ -68,7 +80,7 @@ app.get("/llms.txt", (c) => {
     "One motivational quote per day. Paid endpoint, no API key, no account.",
     "",
     "## Paid endpoint",
-    "- GET /quote — price $0.005 USDC on Base, paid in x402 (HTTP 402 first).",
+    "- GET /quote — price $0.005 USDC on Base, paid in x402 v2 (HTTP 402 first).",
     "- Pay to: 0x85bc619349f7e8603eaf94c886556470f2c95024",
     "- Response: { quote, author, date }",
     "",
@@ -93,5 +105,5 @@ app.get("/quote", (c) => {
 const port = Number(process.env.PORT || 3000);
 serve({ fetch: app.fetch, port }, (info) => {
   console.log(`Mollik Daily Quote API listening on http://localhost:${info.port}`);
-  console.log(`Paid endpoint: GET /quote — ${PRICE} USDC on Base, payTo ${PAY_TO}`);
+  console.log(`Paid endpoint: GET /quote — ${PRICE} USDC on Base (x402 v2), payTo ${PAY_TO}`);
 });

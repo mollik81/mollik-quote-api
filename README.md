@@ -11,18 +11,32 @@ no database, no external API, no secrets, no API key.
 - **Free:** `GET /` (service info), `GET /health` (`{ ok: true }`),
   `GET /llms.txt` (agent-readable docs, plain text).
 
-## Verified locally (2026-11-24, Node v24)
+## Verified locally (2026-11-24, Node v24) — v1.1.0, x402 v2
 
 - `GET /` → 200, `GET /health` → 200, `GET /llms.txt` → 200
 - `GET /quote` unpaid → **402** with:
-  `scheme: exact`, `network: base`, `maxAmountRequired: "5000"`
-  (= $0.005 USDC), `payTo: 0x85bc619349F7E8603EaF94C886556470F2C95024`,
+  `x402Version: 2`, `scheme: exact`, `network: eip155:8453` (Base),
+  `amount: "5000"` (= $0.005 USDC),
+  `payTo: 0x85bc619349F7E8603EaF94C886556470F2C95024`,
   `asset: 0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913` (official USDC on Base),
-  `x402Version: 1`.
+  `maxTimeoutSeconds: 60`.
+- v2 uses `@x402/hono` + `@x402/evm` (the old `x402-hono` v1 package is
+  deprecated). Facilitator is PayAI's public one
+  (`https://facilitator.payai.network`) because the default x402.org
+  facilitator only supports testnets — PayAI supports exact payments on
+  Base mainnet. No API key or account needed for it.
 - A real paid call was NOT tested here — it needs a wallet signature, and
   only Mollik can sign from his wallet. vAPI's own probe does the paid
   check after listing; if it fails, the 402 above is the first thing to
   re-check.
+
+## Update note (2026-11-24 11:07 +06)
+
+v1.0.0 served x402 **v1**; the vAPI wizard requires **v2**
+("vAPI lists x402 v2 offers only", code `v1_legacy`). v1.1.0 fixes that.
+To update a deployed copy: upload these files to the same GitHub repo
+again (drag-and-drop replaces them) — Railway redeploys automatically,
+then re-run the wizard's Discover check with the same `/quote` URL.
 
 ## Run locally
 
@@ -46,7 +60,9 @@ curl http://localhost:3000/quote   # expect HTTP 402, see payment details
 
 ## Publish on vAPI (wizard at api.vapinetwork.ai/call/my-apis/new)
 
-1. **Discover** — paste the public URL + endpoint `GET /quote`.
+1. **Discover** — paste the FULL endpoint URL with the path, e.g.
+   `https://<your-app>.up.railway.app/quote` (the bare origin alone
+   returns 200, not 402 — the wizard needs the `/quote` path).
 2. **Describe** — name "Mollik Daily Quote API", description
    "One motivational quote per day, $0.005 USDC per call on Base (x402)".
 3. **Payout signature** — sign from MetaMask
