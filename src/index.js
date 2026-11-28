@@ -15,7 +15,7 @@ const QUOTES = [
   { quote: "Slow is smooth, smooth is fast.", author: "Navy SEAL saying" },
   { quote: "The best time to start was yesterday. The next best time is now.", author: "Proverb" },
   { quote: "Little by little, a little becomes a lot.", author: "Tanzanian proverb" },
-  { quote: "Do the hard jobs first. The easy jobs will take care of themselves.", author: "Dale Carnegie" },
+  { quote: "The hard jobs first. The easy jobs will take care of themselves.", author: "Dale Carnegie" },
   { quote: "It always seems impossible until it is done.", author: "Nelson Mandela" },
   { quote: "Success is the sum of small efforts, repeated day in and day out.", author: "Robert Collier" },
   { quote: "The secret of getting ahead is getting started.", author: "Mark Twain" },
@@ -25,7 +25,51 @@ const QUOTES = [
 // supports testnets, so this uses PayAI's public facilitator, which
 // supports exact-scheme payments on Base mainnet (eip155:8453).
 // No API key, no account — the facilitator only verifies/setlles.
-const facilitatorClient = new HTTPFacilitatorClient({
+//
+// v1.1.1: diagnostic logging around the facilitator calls. Paid calls
+// from the vapi CLI kept failing with "HTTP 402 after receiving the
+// authorization" (3 attempts, CLI 0.15.0 and 0.16.0), while the same
+// CLI pays other v2 APIs fine — so the failure is in this server's
+// verify step. These logs show the exact facilitator error in the
+// Railway deploy logs. No payment behaviour is changed.
+class LoggingFacilitatorClient extends HTTPFacilitatorClient {
+  async verify(paymentPayload, paymentRequirements) {
+    console.log(
+      "[x402] verify: network=" +
+        paymentRequirements?.network +
+        " amount=" +
+        paymentRequirements?.amount +
+        " payTo=" +
+        paymentRequirements?.payTo,
+    );
+    try {
+      const res = await super.verify(paymentPayload, paymentRequirements);
+      console.log("[x402] verify result: " + JSON.stringify(res).slice(0, 600));
+      return res;
+    } catch (err) {
+      console.log(
+        "[x402] verify ERROR: " + (err?.message || err) + " | " + String(err).slice(0, 600),
+      );
+      throw err;
+    }
+  }
+
+  async settle(paymentPayload, paymentRequirements) {
+    console.log("[x402] settle called");
+    try {
+      const res = await super.settle(paymentPayload, paymentRequirements);
+      console.log("[x402] settle result: " + JSON.stringify(res).slice(0, 600));
+      return res;
+    } catch (err) {
+      console.log(
+        "[x402] settle ERROR: " + (err?.message || err) + " | " + String(err).slice(0, 600),
+      );
+      throw err;
+    }
+  }
+}
+
+const facilitatorClient = new LoggingFacilitatorClient({
   url: "https://facilitator.payai.network",
 });
 const resourceServer = new x402ResourceServer(facilitatorClient).register(
@@ -34,6 +78,18 @@ const resourceServer = new x402ResourceServer(facilitatorClient).register(
 );
 
 const app = new Hono();
+
+// Log every request: method, path, whether a payment header was sent,
+// and the response status. This is what was missing when the paid
+// calls failed — the Railway logs had no request lines at all.
+app.use("*", async (c, next) => {
+  const h = c.req.header("x-payment");
+  console.log(
+    `[http] ${c.req.method} ${c.req.path} x-payment=${h ? "yes len=" + h.length : "no"}`,
+  );
+  await next();
+  console.log(`[http] ${c.req.method} ${c.req.path} -> ${c.res.status}`);
+});
 
 // Paid endpoint: $0.005 USDC on Base (x402 v2, exact scheme).
 // Unpaid requests get HTTP 402 with the payment details — that is the
