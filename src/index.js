@@ -32,6 +32,22 @@ const QUOTES = [
 // CLI pays other v2 APIs fine — so the failure is in this server's
 // verify step. These logs show the exact facilitator error in the
 // Railway deploy logs. No payment behaviour is changed.
+//
+// v1.1.2 FIX (found 2026-11-28 by reading @x402/core 2.32.0):
+// findMatchingRequirements() REQUIRES the payment payload to carry an
+// `accepted` field — the client must echo back the exact accepts entry
+// it is paying for. The vapi CLI does NOT send `accepted` (its header
+// is only 527 chars; a payload with `accepted` is ~750). Without it
+// the middleware returns 402 "No matching payment requirements" BEFORE
+// ever calling the facilitator — which is why the Railway logs showed
+// the payment arriving but no verify call, for the CLI's real payment
+// AND for test payments in both v1 and v2 shapes. A test payment WITH
+// `accepted` DID reach verify (5s round-trip to the facilitator).
+// This middleware fills in `accepted` from the server's own accepts
+// entry when the client omitted it. It changes NOTHING about the real
+// payment check: the facilitator still verifies the actual
+// authorization (amount, payTo, signature, balance, nonce) and a wrong
+// payment still fails there. Only the matching step is repaired.
 class LoggingFacilitatorClient extends HTTPFacilitatorClient {
   async verify(paymentPayload, paymentRequirements) {
     console.log(
@@ -69,6 +85,19 @@ class LoggingFacilitatorClient extends HTTPFacilitatorClient {
   }
 }
 
+// The exact accepts entry the server offers (copied from its own live
+// 402). The injected `accepted` must deep-equal this, so it is defined
+// once here and reused by the payment middleware config below.
+const ACCEPTS_ENTRY = {
+  scheme: "exact",
+  network: "eip155:8453",
+  amount: "5000",
+  asset: "0x833589fCD6eDb6E08f4c7C32D4f71b54bdA02913",
+  payTo: PAY_TO,
+  maxTimeoutSeconds: 60,
+  extra: { name: "USD Coin", version: "2" },
+};
+
 const facilitatorClient = new LoggingFacilitatorClient({
   url: "https://facilitator.payai.network",
 });
@@ -89,6 +118,36 @@ app.use("*", async (c, next) => {
   );
   await next();
   console.log(`[http] ${c.req.method} ${c.req.path} -> ${c.res.status}`);
+});
+
+// Repair incoming payments before the payment middleware sees them
+// (see the v1.1.2 note above): fill in a missing `accepted` field,
+// and copy X-PAYMENT into PAYMENT-SIGNATURE, the header this server
+// actually reads. If the header is not decodable JSON, it is left
+// untouched and the payment middleware will answer 402 as before.
+app.use("/quote", async (c, next) => {
+  const h = c.req.header("x-payment");
+  if (h) {
+    try {
+      const payload = JSON.parse(Buffer.from(h, "base64").toString("utf8"));
+      console.log(
+        `[pay] x402Version=${payload.x402Version} scheme=${payload.scheme} network=${payload.network} accepted=${payload.accepted ? "yes" : "MISSING -> injecting"}`,
+      );
+      if (!payload.accepted) {
+        payload.accepted = ACCEPTS_ENTRY;
+      }
+      // v2 clients must send the payment in the PAYMENT-SIGNATURE
+      // header; this server's extractPayment() reads ONLY that header.
+      // The CLI sends only X-PAYMENT, so copy the (possibly repaired)
+      // payload there too, and refresh X-PAYMENT with the same value.
+      const encoded = Buffer.from(JSON.stringify(payload)).toString("base64");
+      c.req.raw.headers.set("x-payment", encoded);
+      c.req.raw.headers.set("payment-signature", encoded);
+    } catch (err) {
+      console.log("[pay] could not decode x-payment header: " + (err?.message || err));
+    }
+  }
+  await next();
 });
 
 // Paid endpoint: $0.005 USDC on Base (x402 v2, exact scheme).
