@@ -34,20 +34,32 @@ const QUOTES = [
 // Railway deploy logs. No payment behaviour is changed.
 //
 // v1.1.2 FIX (found 2026-11-28 by reading @x402/core 2.32.0):
-// findMatchingRequirements() REQUIRES the payment payload to carry an
-// `accepted` field — the client must echo back the exact accepts entry
-// it is paying for. The vapi CLI does NOT send `accepted` (its header
-// is only 527 chars; a payload with `accepted` is ~750). Without it
-// the middleware returns 402 "No matching payment requirements" BEFORE
-// ever calling the facilitator — which is why the Railway logs showed
-// the payment arriving but no verify call, for the CLI's real payment
-// AND for test payments in both v1 and v2 shapes. A test payment WITH
-// `accepted` DID reach verify (5s round-trip to the facilitator).
-// This middleware fills in `accepted` from the server's own accepts
-// entry when the client omitted it. It changes NOTHING about the real
-// payment check: the facilitator still verifies the actual
-// authorization (amount, payTo, signature, balance, nonce) and a wrong
-// payment still fails there. Only the matching step is repaired.
+// TWO mismatches between the vapi CLI and this server:
+// (1) HEADER NAME: in x402 v2 the payment header is PAYMENT-SIGNATURE;
+// v1 used X-PAYMENT. This server's extractPayment() reads ONLY
+// "payment-signature" — so a payment sent only as X-PAYMENT is treated
+// as UNPAID (402) and verify is never called.
+// (2) MISSING `accepted`: findMatchingRequirements() REQUIRES the
+// payload to carry an `accepted` field — the client must echo back the
+// exact accepts entry it is paying for. Without it the middleware
+// returns 402 "No matching payment requirements" BEFORE ever calling
+// the facilitator.
+// This middleware repairs both: it copies X-PAYMENT into
+// PAYMENT-SIGNATURE and fills in `accepted` from the server's own
+// accepts entry when the client omitted it.
+//
+// v1.1.3 (found 2026-11-28 by reading the vapi CLI 0.16.0 source):
+// the CLI sends BOTH headers, but its X-PAYMENT value is RAW JSON
+// (JSON.stringify), not base64 — so the v1.1.2 injector's base64 decode
+// failed with "Unexpected token 'Ã'". The injector now tries raw JSON
+// first, then base64. (The CLI's PAYMENT-SIGNATURE header is proper
+// base64 v2 with `accepted`, but the 13:30:17 attempt still produced
+// no verify call — so this server also logs which payment headers
+// actually arrived, to see whether Railway/the client drops it.)
+// The repair changes NOTHING about the real payment check: the
+// facilitator still verifies the actual authorization (amount, payTo,
+// signature, balance, nonce) and a wrong payment still fails there.
+// Only the transport mismatches are repaired.
 class LoggingFacilitatorClient extends HTTPFacilitatorClient {
   async verify(paymentPayload, paymentRequirements) {
     console.log(
@@ -121,30 +133,39 @@ app.use("*", async (c, next) => {
 });
 
 // Repair incoming payments before the payment middleware sees them
-// (see the v1.1.2 note above): fill in a missing `accepted` field,
-// and copy X-PAYMENT into PAYMENT-SIGNATURE, the header this server
-// actually reads. If the header is not decodable JSON, it is left
-// untouched and the payment middleware will answer 402 as before.
+// (see the v1.1.2/v1.1.3 notes above): parse the X-PAYMENT header
+// (raw JSON from the vapi CLI, or base64 from other clients), fill in
+// a missing `accepted` field, and copy the result into
+// PAYMENT-SIGNATURE, the header this server actually reads. If the
+// header is not parseable, it is left untouched and the payment
+// middleware will answer 402 as before.
 app.use("/quote", async (c, next) => {
   const h = c.req.header("x-payment");
+  const hasSig = !!c.req.header("payment-signature");
   if (h) {
+    console.log(`[pay] headers: x-payment=yes payment-signature=${hasSig ? "yes" : "no"}`);
+    let payload = null;
     try {
-      const payload = JSON.parse(Buffer.from(h, "base64").toString("utf8"));
+      payload = JSON.parse(h);
+    } catch {
+      try {
+        payload = JSON.parse(Buffer.from(h, "base64").toString("utf8"));
+      } catch {
+        console.log("[pay] could not parse x-payment header (not JSON, not base64 JSON)");
+      }
+    }
+    if (payload) {
       console.log(
         `[pay] x402Version=${payload.x402Version} scheme=${payload.scheme} network=${payload.network} accepted=${payload.accepted ? "yes" : "MISSING -> injecting"}`,
       );
       if (!payload.accepted) {
         payload.accepted = ACCEPTS_ENTRY;
       }
-      // v2 clients must send the payment in the PAYMENT-SIGNATURE
-      // header; this server's extractPayment() reads ONLY that header.
-      // The CLI sends only X-PAYMENT, so copy the (possibly repaired)
-      // payload there too, and refresh X-PAYMENT with the same value.
+      // Re-encode as base64 (the form extractPayment decodes) and
+      // make it available under BOTH header names.
       const encoded = Buffer.from(JSON.stringify(payload)).toString("base64");
       c.req.raw.headers.set("x-payment", encoded);
       c.req.raw.headers.set("payment-signature", encoded);
-    } catch (err) {
-      console.log("[pay] could not decode x-payment header: " + (err?.message || err));
     }
   }
   await next();
